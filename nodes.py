@@ -222,8 +222,8 @@ class HS01OneCrop:
     RETURN_NAMES = ("lora_white", "lora_mask", "waist_white", "waist_photo", "waist_photo_native",
                     "waist_face_mask", "person_mask", "info", "report", "work_width", "work_height")
     OUTPUT_TOOLTIPS = (
-        "头肩白模（从同一个手动框内部派生，给 hs01）",
-        "头肩白模剪影",
+        "hs01 白模（同一个手动框，缩放到 LoRA 档）",
+        "hs01 白模剪影",
         "头到腰白模（手动框，1152×1536 档）",
         "头到腰照片（手动框，1152×1536 档）",
         "头到腰照片（原像素，拼回用）",
@@ -234,8 +234,8 @@ class HS01OneCrop:
         "工作宽度",
         "工作高度",
     )
-    DESCRIPTION = ("只需要手动裁一次：用户只给一个头到腰框（含手臂），"
-                   "头肩框固定取这个框内部 77.5% 宽、顶对齐的子框；不做第二个裁切框，也不做头肩检测。")
+    DESCRIPTION = ("只手动裁一次：把调姿势后的白模按这个框裁下来，直接缩放到 LoRA 档（1152×1536），"
+                   "不再在框内派生头肩子框。")
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -268,7 +268,9 @@ class HS01OneCrop:
         if waist_w < 16 or waist_h < 16:
             raise ValueError(f"手动框太小：{waist_w}×{waist_h}")
 
-        # 唯一手动框 = 头到腰（含手臂）。头肩框只在它内部派生，用户不用再裁第二次。
+        # 只裁这一次：手动框直接作为 hs01 输入，不再派生头肩子框。
+        lx0, ly0, lx1, ly1 = wx0, wy0, wx1, wy1
+        lora_w, lora_h = waist_w, waist_h
         kp, _ = _keypoints(render_json)
         if kp is not None and len(kp) >= 5 and np.isfinite(kp[:5]).all():
             face_cx, face_cy = float(kp[0, 0]), float(kp[0, 1])
@@ -278,68 +280,52 @@ class HS01OneCrop:
             face_cx, face_cy = wx0 + 0.50 * waist_w, wy0 + 0.38 * waist_h
             head_w = max(22.0, 0.30 * waist_w)
 
-        # 头肩子框不靠检测：固定取手动框内 77.5% 宽、顶对齐、水平居中。
-        # 这样用户只裁一次，头肩景别仍然稳定（头宽约 31% 长边）。
-        lora_w = 0.775 * waist_w
-        lora_h = lora_w / 0.75
-        if lora_h > waist_h:
-            lora_h = waist_h
-            lora_w = lora_h * 0.75
-        lora_w, lora_h = max(16.0, lora_w), max(16.0, lora_h)
-        lx0 = wx0 + (waist_w - lora_w) / 2
-        ly0 = wy0
-        lx1, ly1 = lx0 + lora_w, ly0 + lora_h
-        lx0, ly0, lx1, ly1 = _clamp_box(lx0, ly0, lx1, ly1, W, H)
-        lora_w, lora_h = lx1 - lx0, ly1 - ly0
-        if not (wx0 <= lx0 and wy0 <= ly0 and wx1 >= lx1 and wy1 >= ly1):
-            raise ValueError(f"派生头肩框 [{lx0},{ly0},{lx1},{ly1}] 超出唯一手动框 [{wx0},{wy0},{wx1},{wy1}]；把手动框放宽一点")
-
         ratio = waist_w / max(1.0, waist_h)
         work_w, work_h = (1152, 1440) if abs(math.log(ratio / 0.8)) < abs(math.log(ratio / 0.75)) else (1152, 1536)
         sx, sy = work_w / float(waist_w), work_h / float(waist_h)
 
-        white_lora = _resize_rgb(white[ly0:ly1, lx0:lx1], work_w, work_h)
-        mask_lora = _resize_mask(wm_b[ly0:ly1, lx0:lx1].astype(np.float32), work_w, work_h)
-        white_waist = _resize_rgb(white[wy0:wy1, wx0:wx1], work_w, work_h)
+        white_lora = _resize_rgb(white[wy0:wy1, wx0:wx1], work_w, work_h)
+        white_waist = white_lora
         photo_waist = _resize_rgb(photo[wy0:wy1, wx0:wx1], work_w, work_h)
         photo_native = photo[wy0:wy1, wx0:wx1].copy()
 
         if kp is not None and len(kp) >= 5 and np.isfinite(kp[:5]).all():
             face_cx, face_cy, fw, fh = _face_geometry(kp, head_w, face_cx, face_cy)
         else:
-            fw, fh = 0.42 * lora_w, 0.45 * lora_h
+            fw, fh = 0.42 * waist_w, 0.45 * waist_h
         ex, ey = face_cx - wx0, face_cy - wy0
         face_native = _ellipse_mask(waist_h, waist_w, ex, ey, 0.55 * fw, 0.62 * fh, max(2.0, 0.02 * fw))
         face_work = _resize_mask(face_native, work_w, work_h)
         person_work = _resize_mask(wm_b[wy0:wy1, wx0:wx1].astype(np.float32), work_w, work_h)
+        mask_lora = person_work
 
         info = {
             "full_size": [W, H],
-            "lora_box": [lx0, ly0, lx1, ly1],
+            "lora_box": [wx0, wy0, wx1, wy1],
             "waist_box": [wx0, wy0, wx1, wy1],
-            "lora_size": [lora_w, lora_h],
+            "lora_size": [waist_w, waist_h],
             "lora_work_size": [work_w, work_h],
             "waist_size": [waist_w, waist_h],
             "work_size": [work_w, work_h],
             "work_scale": [sx, sy],
             "head_width": head_w,
-            "head_top": ly0 + 0.05 * lora_h,
+            "head_top": wy0 + 0.05 * waist_h,
             "face_center": [face_cx, face_cy],
             "face_size": [fw, fh],
             "waist_y": wy1,
             "shoulder_y": ly1,
             "chest_y": wy1,
-            "head_ratio_lora": head_w / max(lora_w, lora_h),
-            "manual": "one_crop_waist; derived lora",
+            "head_ratio_lora": head_w / max(waist_w, waist_h),
+            "manual": "one_crop_waist; same crop for hs01",
             "source": "hs01_hair_transfer/one_crop/1",
         }
         report = "\n".join([
             f"整张照片 {W}×{H}（只手动裁一次：头到腰）",
             f"手动框（Qwen/成片）：[{wx0},{wy0},{wx1},{wy1}] {waist_w}×{waist_h}",
-            f"内部派生头肩（hs01）：[{lx0},{ly0},{lx1},{ly1}] {lora_w}×{lora_h}（手动框内 77.5% 内缩）",
+            f"hs01 输入：同一个手动框，缩放到 {work_w}×{work_h}（{waist_w}×{waist_h}）",
             f"工作尺寸：{work_w}×{work_h}（缩放 {sx:.3f}×{sy:.3f}）",
-            f"头宽估计 {head_w:.0f}px = 头肩长边 {head_w / max(lora_w, lora_h) * 100:.1f}%",
-            "只裁这一次；头肩框是内部派生，不需要第二个裁切框。",
+            f"头宽估计 {head_w:.0f}px = 手动框长边 {head_w / max(waist_w, waist_h) * 100:.1f}%",
+            "只裁这一次；hs01 直接用这个框缩放到 LoRA 尺寸，不再内部裁头肩。",
         ])
         return ( _img_t(white_lora), _mask_t(mask_lora), _img_t(white_waist), _img_t(photo_waist),
                  _img_t(photo_native), _mask_t(face_work), _mask_t(person_work),
@@ -674,5 +660,5 @@ NODE_CLASS_MAPPINGS = {
     "HS01OneCrop": HS01OneCrop,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "HS01OneCrop": "hs02 一次手动裁切（头到腰，内部带头肩）",
+    "HS01OneCrop": "hs02 一次手动裁切（白模裁切→LoRA 尺寸）",
 }
